@@ -1,4 +1,4 @@
-# reverse-proxy
+# bridgeproxy
 
 A lightweight HTTP/WebSocket reverse proxy with a terminal UI. Useful any time you need to bridge a server that is only reachable from one machine (via VPN, Tailscale, a private network, or any other means) to devices that cannot reach it directly.
 
