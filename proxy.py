@@ -161,6 +161,155 @@ async def handle_http(req: web.Request, upstream: str, proxy_base: str, state: S
     return resp
 
 
+# ── Parallel range fetching ─────────────────────────────────────────────────
+#
+# A single TCP/WireGuard flow over a high-latency tunnel (e.g. Tailscale to a
+# remote, CGNAT'd server) caps far below the link's aggregate capacity. Emby
+# direct-play uses one connection per stream, so it gets stuck at that per-flow
+# ceiling and high-bitrate titles buffer. Aggregate throughput scales with the
+# number of connections, so for media GETs we fan out into several concurrent
+# Range requests upstream and reassemble them into the single stream the client
+# sees — bypassing the per-flow limit without the client knowing.
+
+
+def parse_range(range_header: str | None) -> tuple[int, int | None] | None:
+    """Parse a single `bytes=start-end` Range header.
+
+    Returns (start, end) with end possibly None (open-ended). Returns None for
+    absent, multi-range, or suffix (`bytes=-N`) ranges — those fall back to the
+    normal single-connection path.
+    """
+    if not range_header or not range_header.startswith("bytes="):
+        return None
+    spec = range_header[len("bytes="):].split(",")[0].strip()
+    if "," in range_header[len("bytes="):] or "-" not in spec:
+        return None
+    a, _, b = spec.partition("-")
+    if a == "":  # suffix range — uncommon for video, let it fall through
+        return None
+    try:
+        start = int(a)
+        end = int(b) if b else None
+    except ValueError:
+        return None
+    return start, end
+
+
+async def _read_segment(session, url, headers: CIMultiDict, s: int, e: int) -> bytes:
+    h = headers.copy()
+    h["Range"] = f"bytes={s}-{e}"
+    async with session.get(url, headers=h) as r:
+        return await r.read()
+
+
+async def handle_parallel(req, upstream, proxy_base, state, start, client_end):
+    ip = req.remote
+    url = upstream + req.path_qs
+    session = req.app["session"]
+    seg = req.app["seg_size"]
+    nconn = req.app["parallel_conn"]
+
+    base_headers = build_request_headers(req)
+    base_headers.pop("Range", None)  # we set our own per-segment Range
+
+    # Probe the first segment: confirms range support and reveals total size.
+    probe_end = start + seg - 1
+    if client_end is not None:
+        probe_end = min(probe_end, client_end)
+    probe = await session.get(url, headers={**base_headers, "Range": f"bytes={start}-{probe_end}"})
+
+    # Range unsupported / redirect / error → behave like the normal path.
+    if probe.status != 206:
+        resp = web.StreamResponse(
+            status=probe.status,
+            headers=build_response_headers(probe.headers, upstream, proxy_base),
+        )
+        await resp.prepare(req)
+        try:
+            async for chunk in probe.content.iter_chunked(65536):
+                await resp.write(chunk)
+                state.device(ip).record_down(len(chunk))
+            await resp.write_eof()
+        finally:
+            probe.release()
+        state.log(req.method, req.path, ip, probe.status)
+        return resp
+
+    # Derive total size from Content-Range: "bytes s-e/total".
+    total = None
+    cr = probe.headers.get("Content-Range", "")
+    if "/" in cr:
+        tail = cr.rsplit("/", 1)[-1].strip()
+        if tail.isdigit():
+            total = int(tail)
+    if client_end is not None:
+        effective_end = client_end
+    elif total is not None:
+        effective_end = total - 1
+    else:
+        effective_end = probe_end
+
+    # Present the client a single coherent response spanning the whole range.
+    out = build_response_headers(probe.headers, upstream, proxy_base)
+    out.pop("Content-Range", None)
+    out.pop("Content-Length", None)
+    out["Accept-Ranges"] = "bytes"
+    out["Content-Length"] = str(effective_end - start + 1)
+    client_had_range = req.headers.get("Range") is not None
+    if client_had_range:
+        status = 206
+        if total is not None:
+            out["Content-Range"] = f"bytes {start}-{effective_end}/{total}"
+    else:
+        status = 200
+
+    resp = web.StreamResponse(status=status, headers=out)
+    await resp.prepare(req)
+
+    segments = []
+    s = start
+    while s <= effective_end:
+        e = min(s + seg - 1, effective_end)
+        segments.append((s, e))
+        s = e + 1
+
+    tasks: dict[int, asyncio.Task] = {}
+    probe_open = True
+    try:
+        # Kick off look-ahead fetches (segments 1..nconn-1) so they download
+        # concurrently with the probe body (segment 0).
+        nxt = 1
+        for i in range(1, min(nconn, len(segments))):
+            s_i, e_i = segments[i]
+            tasks[i] = asyncio.create_task(_read_segment(session, url, base_headers, s_i, e_i))
+            nxt = i + 1
+
+        seg0 = await probe.read()
+        probe.release()
+        probe_open = False
+        await resp.write(seg0)
+        state.device(ip).record_down(len(seg0))
+
+        for i in range(1, len(segments)):
+            data = await tasks.pop(i)
+            await resp.write(data)
+            state.device(ip).record_down(len(data))
+            if nxt < len(segments):
+                s_n, e_n = segments[nxt]
+                tasks[nxt] = asyncio.create_task(_read_segment(session, url, base_headers, s_n, e_n))
+                nxt += 1
+
+        await resp.write_eof()
+    finally:
+        if probe_open:
+            probe.release()
+        for t in tasks.values():
+            t.cancel()
+
+    state.log(req.method, req.path, ip, status)
+    return resp
+
+
 async def handler(req: web.Request):
     upstream = req.app["upstream"]
     proxy_base = req.app["proxy_base"]
@@ -168,6 +317,12 @@ async def handler(req: web.Request):
 
     if req.headers.get("upgrade", "").lower() == "websocket":
         return await handle_websocket(req, upstream, state)
+
+    if req.method == "GET" and req.app["parallel_conn"] > 1:
+        rng = parse_range(req.headers.get("Range"))
+        if rng is not None:
+            return await handle_parallel(req, upstream, proxy_base, state, rng[0], rng[1])
+
     return await handle_http(req, upstream, proxy_base, state)
 
 
@@ -383,6 +538,9 @@ def main():
     aiohttp_app["upstream"] = upstream.rstrip("/")
     aiohttp_app["proxy_base"] = proxy_base
     aiohttp_app["state"] = state
+    # Parallel range fetching for media GETs (set parallel_connections to 1 to disable).
+    aiohttp_app["parallel_conn"] = int(cfg.get("parallel_connections", 8))
+    aiohttp_app["seg_size"] = int(cfg.get("segment_size_mb", 4)) * 1024 * 1024
 
     async def on_startup(app):
         app["session"] = ClientSession(connector=TCPConnector(ssl=False), auto_decompress=False)
