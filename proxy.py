@@ -300,6 +300,8 @@ async def handle_parallel(req, upstream, proxy_base, state, start, client_end):
                 nxt += 1
 
         await resp.write_eof()
+    except ConnectionResetError:
+        pass  # client seeked/stopped mid-stream — normal for media playback
     finally:
         if probe_open:
             probe.release()
