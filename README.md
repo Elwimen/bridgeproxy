@@ -5,6 +5,10 @@ A lightweight HTTP/WebSocket reverse proxy with a terminal UI. Useful any time y
 ## Features
 
 - HTTP and WebSocket proxying
+- Parallel range fetching — pulls media (any GET with a `Range` header) over several
+  concurrent upstream connections and reassembles it in order, beating the
+  per-connection throughput cap of high-latency tunnels (e.g. Tailscale over the
+  internet). The client still sees one normal stream.
 - TUI with per-device bandwidth (download speed, totals, request count)
 - Scrolling request log, color-coded by status
 - First-run setup wizard if no config is present
@@ -55,8 +59,21 @@ python proxy.py --upstream http://myserver:8080 --config
     "upstream": "http://hostname:port",
     "host": "0.0.0.0",
     "port": 8080,
-    "silent": false
+    "silent": false,
+    "parallel_connections": 8,
+    "segment_size_mb": 4
 }
 ```
 
 CLI args always override `config.json`. Use `--config` to persist CLI args back to the file.
+
+### Parallel fetching
+
+- `parallel_connections` — number of concurrent upstream connections used for media
+  streams (GETs with a `Range` header). Raise it if a single high-latency link still
+  can't keep up with high-bitrate content; set to `1` to disable and fall back to a
+  single connection. Default `8`.
+- `segment_size_mb` — size of each range chunk requested upstream. Default `4`.
+
+Only `Range` GETs use this path; other requests proxy through a single connection
+unchanged.
